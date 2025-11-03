@@ -95,3 +95,136 @@
 # {'type': 'cm_matrix', 'dataset': 'train', 'true_0': {"predicted_0": 15562, "predicte_1": 666}, 'true_1': {"predicted_0": 3333, "predicted_1": 1444}}
 # {'type': 'cm_matrix', 'dataset': 'test', 'true_0': {"predicted_0": 15562, "predicte_1": 650}, 'true_1': {"predicted_0": 2490, "predicted_1": 1420}}
 #
+
+import json
+import gzip
+import os
+import pickle
+import zipfile
+from pathlib import Path
+
+import pandas as pd
+from sklearn.pipeline import Pipeline
+from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.decomposition import PCA
+from sklearn.feature_selection import SelectKBest, f_classif
+from sklearn.svm import SVC
+from sklearn.model_selection import GridSearchCV
+from sklearn.metrics import (
+    balanced_accuracy_score,
+    precision_score,
+    recall_score,
+    f1_score,
+    confusion_matrix,
+)
+
+def _leer_zip_csv(ruta_zip: str, nombre_interno: str) -> pd.DataFrame:
+    with zipfile.ZipFile(ruta_zip, "r") as zf:
+        with zf.open(nombre_interno) as f:
+            return pd.read_csv(f)
+
+def _depurar(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    out = out.drop("ID", axis=1)
+    out = out.rename(columns={"default payment next month": "default"})
+    out = out.dropna()
+    out = out[(out["EDUCATION"] != 0) & (out["MARRIAGE"] != 0)]
+    out.loc[out["EDUCATION"] > 4, "EDUCATION"] = 4
+    return out
+
+def _armar_busqueda() -> GridSearchCV:
+    cat_cols = ["SEX", "EDUCATION", "MARRIAGE"]
+    num_cols = [
+        "LIMIT_BAL", "AGE", "PAY_0", "PAY_2", "PAY_3", "PAY_4", "PAY_5", "PAY_6",
+        "BILL_AMT1", "BILL_AMT2", "BILL_AMT3", "BILL_AMT4", "BILL_AMT5", "BILL_AMT6",
+        "PAY_AMT1", "PAY_AMT2", "PAY_AMT3", "PAY_AMT4", "PAY_AMT5", "PAY_AMT6",
+    ]
+
+    preprocess = ColumnTransformer(
+        transformers=[
+            ("cat", OneHotEncoder(handle_unknown="ignore"), cat_cols),
+            ("std", StandardScaler(), num_cols),
+        ],
+        remainder="passthrough",
+    )
+
+    pipe = Pipeline(steps=[
+        ("prep", preprocess),
+        ("pca", PCA()),                      # todas las componentes
+        ("kbest", SelectKBest(score_func=f_classif)),
+        ("svc", SVC(kernel="rbf", random_state=42)),
+    ])
+
+    grid = {
+        "pca__n_components": [20, 21],
+        "kbest__k": [12],
+        "svc__kernel": ["rbf"],
+        "svc__gamma": [0.099],
+    }
+
+    return GridSearchCV(
+        estimator=pipe,
+        param_grid=grid,
+        cv=10,
+        refit=True,
+        verbose=1,
+        return_train_score=False,
+        scoring="balanced_accuracy",
+    )
+
+def _metricas(nombre: str, y_true, y_pred) -> dict:
+    return {
+        "type": "metrics",
+        "dataset": nombre,
+        "precision": precision_score(y_true, y_pred),
+        "balanced_accuracy": balanced_accuracy_score(y_true, y_pred),
+        "recall": recall_score(y_true, y_pred),
+        "f1_score": f1_score(y_true, y_pred),
+    }
+
+def _cm(nombre: str, y_true, y_pred) -> dict:
+    tn, fp, fn, tp = confusion_matrix(y_true, y_pred).ravel()
+    return {
+        "type": "cm_matrix",
+        "dataset": nombre,
+        "true_0": {"predicted_0": int(tn), "predicted_1": int(fp)},
+        "true_1": {"predicted_0": int(fn), "predicted_1": int(tp)},
+    }
+
+def _guardar_modelo(objeto) -> None:
+    Path("files/models").mkdir(parents=True, exist_ok=True)
+    with gzip.open("files/models/model.pkl.gz", "wb") as fh:
+        pickle.dump(objeto, fh)
+
+def _guardar_jsonl(registros: list[dict]) -> None:
+    Path("files/output").mkdir(parents=True, exist_ok=True)
+    with open("files/output/metrics.json", "w", encoding="utf-8") as f:
+        for r in registros:
+            f.write(json.dumps(r) + "\n")
+
+if __name__ == "__main__":
+    test_zip = "files/input/test_data.csv.zip"
+    train_zip = "files/input/train_data.csv.zip"
+    interno_test = "test_default_of_credit_card_clients.csv"
+    interno_train = "train_default_of_credit_card_clients.csv"
+
+    df_test = _depurar(_leer_zip_csv(test_zip, interno_test))
+    df_train = _depurar(_leer_zip_csv(train_zip, interno_train))
+
+    X_tr, y_tr = df_train.drop("default", axis=1), df_train["default"]
+    X_te, y_te = df_test.drop("default", axis=1), df_test["default"]
+
+    search = _armar_busqueda()
+    search.fit(X_tr, y_tr)
+    _guardar_modelo(search)
+
+    y_tr_pred = search.predict(X_tr)
+    y_te_pred = search.predict(X_te)
+
+    train_metrics = _metricas("train", y_tr, y_tr_pred)
+    test_metrics  = _metricas("test",  y_te, y_te_pred)
+    train_cm      = _cm("train", y_tr, y_tr_pred)
+    test_cm       = _cm("test",  y_te, y_te_pred)
+
+    _guardar_jsonl([train_metrics, test_metrics, train_cm, test_cm])
